@@ -7,31 +7,22 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RestController;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.FluxSink;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
 import java.time.Duration;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.function.Consumer;
-import java.util.function.Function;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
 
 @RestController
 public class GreetingController {
-	private final ManagableThreadPoolExecutor threadPoolExecutor;
-
-	private Map<String, Disposable> disposableMap;
+	private final ConcurrentMap<String, Disposable> disposableMap;
 
 	public GreetingController() {
-		threadPoolExecutor = new ManagableThreadPoolExecutor();
-
-		disposableMap = new HashMap<>();
+		disposableMap = new ConcurrentHashMap<>();
 	}
 
 	@GetMapping(value = "foo")
@@ -39,15 +30,8 @@ public class GreetingController {
 		return wrapResponse2(UUID.randomUUID().toString(), this::getData1);
 	}
 
-	private Flux<Event> getData1() {
-		return Flux.range(0, 10).delayElements(Duration.ofSeconds(1)).<Event>map(i -> new DataEvent(new Graph(i, "HELLO")))
-				.doOnNext(event -> System.out.println("Next event : " + event));
-	}
-
 	@GetMapping(value = "tasks/cancel/{id}")
 	public void cancelTask(@PathVariable("id") String id) {
-//		threadPoolExecutor.cancel(id);
-
 		Disposable disposable = disposableMap.get(id);
 		if (disposable != null) {
 			disposable.dispose();
@@ -70,55 +54,28 @@ public class GreetingController {
 		return disposableMap.keySet();
 	}
 
-	private Flux<ServerSentEvent<Object>> wrapResponse(String taskId, Consumer<FluxSink<Event>> sinkConsumer) {
-		Mono<Event> start = Mono.just(new StartEvent(taskId));
-
-		System.out.println("Thread name: " + Thread.currentThread().getName());
-		Flux<Event> events = Flux.create(eventFluxSink -> {
-			threadPoolExecutor.submitTask(taskId, () -> {
-				try {
-					sinkConsumer.accept(eventFluxSink);
-				} catch (Throwable e) {
-					eventFluxSink.next(new ExceptionEvent(e));
-					eventFluxSink.complete();
-				}
-			});
-		});
-
-		return Flux.concat(start, events).map(o -> ServerSentEvent.builder().data(o.getData()).event(o.getType()).build());
-	}
-
 	private Flux<ServerSentEvent<Object>> wrapResponse2(String taskId, Supplier<Flux<Event>> method) {
 		Mono<Event> start = Mono.just(new StartEvent(taskId));
 		Flux<Event> forwardedDataFlux = Flux.create(eventFluxSink -> {
 			Flux<Event> dataFlux = method.get();
 			Disposable disposable = dataFlux
-					.doOnCancel(new Runnable() {
-						@Override
-						public void run() {
-							eventFluxSink.next(new CancelEvent());
-							eventFluxSink.complete();
+					.doOnCancel(() -> {
+						eventFluxSink.next(new CancelEvent());
+						eventFluxSink.complete();
 
-							disposableMap.remove(taskId);
-						}
+						disposableMap.remove(taskId);
 					})
-					.doOnComplete(new Runnable() {
-						@Override
-						public void run() {
-							eventFluxSink.next(new CompleteEvent());
-							eventFluxSink.complete();
+					.doOnComplete(() -> {
+						eventFluxSink.next(new CompleteEvent());
+						eventFluxSink.complete();
 
-							disposableMap.remove(taskId);
-						}
+						disposableMap.remove(taskId);
 					})
-					.doOnError(new Consumer<Throwable>() {
-						@Override
-						public void accept(Throwable throwable) {
-							eventFluxSink.next(new ExceptionEvent(throwable));
-							eventFluxSink.complete();
+					.doOnError(throwable -> {
+						eventFluxSink.next(new ExceptionEvent(throwable));
+						eventFluxSink.complete();
 
-							disposableMap.remove(taskId);
-						}
+						disposableMap.remove(taskId);
 					})
 					.doOnNext(eventFluxSink::next)
 					.subscribe();
@@ -129,62 +86,12 @@ public class GreetingController {
 		return Flux.concat(start, forwardedDataFlux).map(o -> ServerSentEvent.builder().data(o.getData()).event(o.getType()).build());
 	}
 
-	private void startGeneratingValues(FluxSink<Event> sink) {
-		System.out.println("Thread name: " + Thread.currentThread().getName());
-
-		final Random random = new Random();
-
-//		final ScheduledExecutorService service = Executors.newSingleThreadScheduledExecutor();
-//		service.scheduleAtFixedRate(new Runnable() {
-
-		File file = new File("test.txt");
-		try {
-			file.createNewFile();
-		} catch (IOException e) {
-			e.printStackTrace();
-		}
-
-		FileWriter fileWriter = null;
-
-		try {
-			fileWriter = new FileWriter(file);
-		} catch (IOException e) {
-			e.printStackTrace();
-		}
-
-		sink.next(new DataEvent(new Graph(0, String.valueOf(random.nextFloat()))));
-		for (int i = 0; i < 20000; i++) {
-			sink.next(new ProgressEvent(i * 5));
-
-
-			if (fileWriter != null) {
-				try {
-					fileWriter.append('c');
-
-					if (i % 5 == 0) {
-						fileWriter.flush();
-					}
-				} catch (IOException e) {
-					e.printStackTrace();
-				}
-			}
-
-			try {
-				Thread.sleep(500);
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-
-//				throw new RuntimeException(e);
-			}
-		}
-
-		sink.next(new ProgressEvent(100));
-		sink.complete();
-
-
-//			@Override
-//			public void run() {
-//		}, 300, 300, TimeUnit.MILLISECONDS);
+	private Flux<Event> getData1() {
+		return Flux.range(0, 10)
+				.delayElements(Duration.ofSeconds(1))
+				.publishOn(Schedulers.boundedElastic())
+				.<Event>map(i -> new DataEvent(new Graph(i, "HELLO")))
+				.doOnNext(event -> System.out.println("Event " + event.getData() + " on thread " + Thread.currentThread().getName()));
 	}
 
 	public static class Graph {
